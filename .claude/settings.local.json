@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"not a real evtx\")",
+      "Bash(./hayabusa/hayabusa json-timeline *)",
+      "Bash(echo \"EXIT: $?\")",
+      "Read(//tmp/**)",
+      "Bash(mkdir -p /tmp/evtx_sample)",
+      "Bash(curl -sL \"https://raw.githubusercontent.com/Yamato-Security/hayabusa-sample-evtx/main/DeepBlueCLI/mimikatz-privesc-hashdump.evtx\" -o /tmp/evtx_sample/sample.evtx)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "hayabusa"
+  ]
+}
