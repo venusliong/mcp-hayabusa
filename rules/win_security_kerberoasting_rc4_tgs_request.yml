@@ -1,0 +1,34 @@
+title: Potential Kerberoasting via RC4 Service Ticket Request
+id: 5f8b6a13-4d2e-4c9a-8e7f-2a6b1d3c9e45
+status: stable
+description: |
+    Detects Kerberos service ticket (TGS) requests using weak RC4 encryption
+    (etype 0x17) for a non-krbtgt, non-machine service account, which is the
+    signature of Kerberoasting: requesting tickets for accounts with an SPN so
+    the ticket can be cracked offline to recover the service account's password.
+references:
+    - https://attack.mitre.org/techniques/T1558/003/
+    - https://adsecurity.org/?p=2293
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    - attack.credential-access
+    - attack.t1558.003
+logsource:
+    product: windows
+    service: security
+    definition: 'Requires "Audit Kerberos Service Ticket Operations" to be enabled'
+detection:
+    selection:
+        EventID: 4769
+        TicketEncryptionType: '0x17'
+        TicketOptions: '0x40810000'
+    filter_machine_accounts:
+        ServiceName|endswith: '$'
+    filter_krbtgt:
+        ServiceName: 'krbtgt'
+    condition: selection and not 1 of filter_*
+falsepositives:
+    - Legacy applications or service accounts that only support RC4 and are
+      requested at normal, low frequency during business operations.
+level: high

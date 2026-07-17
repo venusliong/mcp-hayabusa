@@ -1,0 +1,38 @@
+title: LSASS Memory Dump via ProcDump
+id: 9a6d1e1c-2b3f-4b8a-9c1a-6e2f0d8a5b71
+status: stable
+description: |
+    Detects usage of Sysinternals ProcDump to dump the memory of the LSASS process,
+    a common technique for harvesting credentials (password hashes, Kerberos tickets)
+    for offline cracking or pass-the-hash attacks.
+references:
+    - https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
+    - https://attack.mitre.org/techniques/T1003/001/
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+    - attack.s0029
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_image:
+        - Image|endswith:
+              - '\procdump.exe'
+              - '\procdump64.exe'
+        - OriginalFileName: 'procdump'
+    selection_target:
+        CommandLine|contains:
+            - 'lsass'
+            - 'lsass.exe'
+    selection_flags:
+        CommandLine|contains:
+            - ' -ma '
+            - ' -mp '
+    condition: selection_image and selection_target and selection_flags
+falsepositives:
+    - Legitimate use by administrators or support engineers troubleshooting LSASS
+      issues under a documented change ticket.
+level: high

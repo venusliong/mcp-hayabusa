@@ -1,0 +1,39 @@
+title: Potential DCSync Attack via Directory Replication Rights Abuse
+id: 7b1d4f92-6c8a-4e3b-9f1d-8a5c2e7b0d34
+status: stable
+description: |
+    Detects a directory service access event where a non-domain-controller
+    security principal is granted access using the DS-Replication-Get-Changes
+    or DS-Replication-Get-Changes-All extended rights against a domain naming
+    context. This combination of access mask and property GUID is what
+    Mimikatz's "lsadump::dcsync" and similar tooling generate when impersonating
+    a domain controller to replicate password hashes (DCSync).
+references:
+    - https://attack.mitre.org/techniques/T1003/006/
+    - https://adsecurity.org/?p=1729
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    - attack.credential-access
+    - attack.t1003.006
+logsource:
+    product: windows
+    service: security
+    definition: 'Requires "Audit Directory Service Access" for the domain object with the SACL applied'
+detection:
+    selection_event:
+        EventID: 4662
+        AccessMask: '0x100'
+    selection_property:
+        Properties|contains:
+            - '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' # DS-Replication-Get-Changes-All
+            - '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' # DS-Replication-Get-Changes
+            - '89e95b76-444d-4c62-991a-0facbeda640c' # DS-Replication-Get-Changes-In-Filtered-Set
+    filter_domain_controllers:
+        SubjectUserName|endswith: '$'
+    condition: selection_event and selection_property and not filter_domain_controllers
+falsepositives:
+    - Legitimate domain controllers and directory-integrated services (Azure AD
+      Connect, backup/replication tooling) that hold replication rights and
+      should be added to the filter list above by SID or account name.
+level: critical

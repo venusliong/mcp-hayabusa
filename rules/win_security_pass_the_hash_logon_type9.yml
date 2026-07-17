@@ -1,0 +1,35 @@
+title: Potential Pass-the-Hash via NTLM NewCredentials Logon
+id: e2c9a7d1-3b6f-4a8c-9d5e-7f1c4a2b8e60
+status: experimental
+description: |
+    Detects a logon event (4624) with LogonType 9 (NewCredentials) using the
+    NTLM authentication package. NewCredentials logons are created by tools such
+    as "runas /netonly" and pass-the-hash utilities (e.g. Mimikatz
+    "sekurlsa::pth", Impacket "psexec.py -hashes") that spawn a process locally
+    while presenting captured NTLM hash material for outbound network
+    authentication, without ever touching the plaintext password.
+references:
+    - https://attack.mitre.org/techniques/T1550/002/
+    - https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4624
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    - attack.lateral-movement
+    - attack.t1550.002
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4624
+        LogonType: 9
+        AuthenticationPackageName: 'Negotiate'
+    selection_ntlm_hint:
+        LogonProcessName:
+            - 'seclogo'
+            - 'Advapi'
+    condition: selection and selection_ntlm_hint
+falsepositives:
+    - Administrators using "runas /netonly" for legitimate cross-credential
+      remote administration.
+level: medium

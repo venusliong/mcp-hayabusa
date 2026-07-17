@@ -1,0 +1,39 @@
+title: Suspicious Access Rights Requested Against LSASS Process
+id: c3e7a2b4-8f1d-4a6e-b3c2-1d9f4e7a0c62
+status: stable
+description: |
+    Detects process access (Sysinternals Sysmon Event ID 10) against lsass.exe with
+    a GrantedAccess mask commonly associated with credential dumping tools (Mimikatz,
+    ProcDump, custom minidump implementations) rather than legitimate LSA callers.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+    service: sysmon
+detection:
+    selection_target:
+        TargetImage|endswith: '\lsass.exe'
+    selection_access:
+        GrantedAccess:
+            - '0x1010'
+            - '0x1410'
+            - '0x1438'
+            - '0x143a'
+            - '0x1fffff'
+    filter_known_source:
+        SourceImage|endswith:
+            - '\werfault.exe'
+            - '\wermgr.exe'
+            - '\MsMpEng.exe'
+    condition: selection_target and selection_access and not filter_known_source
+falsepositives:
+    - Endpoint security agents and crash-reporting utilities that legitimately open
+      lsass.exe with broad access rights (should be excluded via filter list above).
+level: high

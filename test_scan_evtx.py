@@ -6,7 +6,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-import server_lowlevel as server
+import server
 
 SAMPLE_URL = (
     "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/"
