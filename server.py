@@ -28,6 +28,7 @@ HAYABUSA_DIR = REPO_ROOT / "hayabusa"
 HAYABUSA_BIN = HAYABUSA_DIR / "hayabusa"
 RULES_DIR = HAYABUSA_DIR / "rules"
 DETECTION_RULES_DIR = REPO_ROOT / "rules"
+ATTACK_DATA_PATH = REPO_ROOT / "attack" / "enterprise-attack.json"
 
 ATTACK_TECHNIQUE_TAG_RE = re.compile(r"^attack\.(t\d{4}(?:\.\d{3})?)$", re.IGNORECASE)
 
@@ -407,9 +408,78 @@ def _rule_summary(rule: dict) -> dict:
     }
 
 
+_attack_techniques_cache: dict[str, dict] | None = None
+
+
+def _load_attack_techniques() -> dict[str, dict]:
+    """Parse the MITRE ATT&CK Enterprise STIX bundle, caching the result.
+
+    Returns a dict keyed by uppercase technique ID (e.g. "T1003.001"), since a
+    technique can carry multiple external_references (only one of which is the
+    ATT&CK ID itself) and STIX has no more direct way to look one up.
+    """
+    global _attack_techniques_cache
+    if _attack_techniques_cache is not None:
+        return _attack_techniques_cache
+
+    if not ATTACK_DATA_PATH.is_file():
+        raise FileNotFoundError(
+            f"ATT&CK data not found at {ATTACK_DATA_PATH}. "
+            "Run scripts/download_attack_data.py to download it."
+        )
+
+    with ATTACK_DATA_PATH.open() as f:
+        bundle = json.load(f)
+
+    techniques = {}
+    for obj in bundle.get("objects", []):
+        if obj.get("type") != "attack-pattern":
+            continue
+        technique_id = None
+        url = None
+        for ref in obj.get("external_references") or []:
+            if ref.get("source_name") == "mitre-attack" and ref.get("external_id"):
+                technique_id = ref["external_id"].upper()
+                url = ref.get("url")
+                break
+        if not technique_id:
+            continue
+
+        techniques[technique_id] = {
+            "technique_id": technique_id,
+            "name": obj.get("name"),
+            "description": obj.get("description"),
+            "url": url,
+            "is_subtechnique": bool(obj.get("x_mitre_is_subtechnique")),
+            "tactics": sorted({
+                phase["phase_name"]
+                for phase in obj.get("kill_chain_phases") or []
+                if phase.get("kill_chain_name") == "mitre-attack" and phase.get("phase_name")
+            }),
+            "deprecated": bool(obj.get("x_mitre_deprecated")) or bool(obj.get("revoked")),
+        }
+
+    _attack_techniques_cache = techniques
+    return techniques
+
+
+def _coverage_assessment(rules: list[dict]) -> str:
+    """Classify detection coverage for a technique from its matching Sigma rules.
+
+    "stable" rules are Sigma's production-ready status; anything else
+    (experimental/test/deprecated/unsupported) exists but isn't fully trusted yet.
+    """
+    if not rules:
+        return "gap"
+    if any(r.get("status") == "stable" for r in rules):
+        return "covered"
+    return "partial"
+
+
 DETECTION_RULES_LIST_URI = "detection://rules"
 DETECTION_RULE_URI_PREFIX = "detection://rules/"
 DETECTION_RULES_BY_TECHNIQUE_PREFIX = "detection://rules/by-technique/"
+DETECTION_ATTACK_TECHNIQUE_PREFIX = "detection://attack/techniques/"
 
 
 def _rule_resource_uri(rule_name: str) -> str:
@@ -459,6 +529,16 @@ async def list_resource_templates() -> list[types.ResourceTemplate]:
             ),
             mimeType="application/json",
         ),
+        types.ResourceTemplate(
+            uriTemplate=f"{DETECTION_ATTACK_TECHNIQUE_PREFIX}{{technique_id}}",
+            name="ATT&CK technique detail with detection coverage",
+            description=(
+                "Fetch an ATT&CK technique's name/description plus which of our Sigma "
+                "rules detect it and a coverage assessment (covered/partial/gap), "
+                "e.g. detection://attack/techniques/T1003.001."
+            ),
+            mimeType="application/json",
+        ),
     ]
 
 
@@ -483,6 +563,36 @@ async def read_resource(uri: AnyUrl) -> list[ReadResourceContents]:
         payload = {"technique_id": technique_id, "total_rules": len(matches), "rules": matches}
         return [ReadResourceContents(content=json.dumps(payload, indent=2), mime_type="application/json")]
 
+    if uri_str.startswith(DETECTION_ATTACK_TECHNIQUE_PREFIX):
+        technique_id = uri_str[len(DETECTION_ATTACK_TECHNIQUE_PREFIX):].strip().upper()
+        if not technique_id:
+            raise ValueError("Missing technique_id in URI")
+
+        techniques = _load_attack_techniques()
+        technique = techniques.get(technique_id)
+        if technique is None:
+            raise FileNotFoundError(f"No ATT&CK technique {technique_id!r} found")
+
+        matches = [
+            _rule_summary(r)
+            for r in _load_detection_rules()
+            if technique_id in _technique_ids_from_tags(r["tags"])
+        ]
+        payload = {
+            "technique_id": technique_id,
+            "name": technique["name"],
+            "description": technique["description"],
+            "url": technique["url"],
+            "is_subtechnique": technique["is_subtechnique"],
+            "tactics": technique["tactics"],
+            "deprecated": technique["deprecated"],
+            "detecting_rules": matches,
+            "coverage": _coverage_assessment(matches),
+        }
+        return [ReadResourceContents(content=json.dumps(payload, indent=2), mime_type="application/json")]
+
+    # NOTE: this must come after DETECTION_RULES_BY_TECHNIQUE_PREFIX above, since
+    # "detection://rules/by-technique/..." also starts with "detection://rules/".
     if uri_str.startswith(DETECTION_RULE_URI_PREFIX):
         rule_name = uri_str[len(DETECTION_RULE_URI_PREFIX):].strip()
         if not rule_name:

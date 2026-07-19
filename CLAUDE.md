@@ -8,7 +8,12 @@ Hayabusa scanning: implemented. The server runs and both tools are manually test
 
 Sigma rule resources: implemented and under pytest (`tests/`). This is the one part of the project with a real automated test suite; everything else is still manual-script-only.
 
-Detection engineering knowledge base: **partially implemented.** Sigma rules under `rules/` are exposed as MCP resources (see "Resources" below) — that part is done. ATT&CK-mappings-as-a-directory (`mappings/`) and a dedicated coverage-query tool are still **not implemented**; technique lookups currently go through the `detection://rules/by-technique/{technique_id}` resource instead. See "Planned expansion" below for what's left.
+Detection engineering knowledge base: **mostly implemented.** Sigma rules under `rules/`
+are exposed as MCP resources, and ATT&CK technique lookups (name/description/coverage)
+are exposed via `detection://attack/techniques/{technique_id}`, sourced live from the
+MITRE ATT&CK STIX bundle rather than a checked-in `mappings/` directory — that directory
+is no longer planned. A dedicated coverage-query tool (e.g. "list every technique with no
+rule at all") is still **not implemented**; see "Planned expansion" below.
 
 ## Purpose
 
@@ -30,8 +35,19 @@ Sigma tags.
   by filename stem (e.g. `detection://rules/proc_creation_win_lsass_dump_procdump`).
 - **`detection://rules/by-technique/{technique_id}`** — JSON summary of rules tagged with
   a given ATT&CK technique ID, case-insensitive (e.g. `detection://rules/by-technique/T1003.001`).
+- **`detection://attack/techniques/{technique_id}`** — a single ATT&CK technique's name,
+  description, MITRE URL, tactics, and sub-technique/deprecated flags, plus which of our
+  Sigma rules detect it and a `coverage` assessment (`"covered"` if at least one matching
+  rule has Sigma `status: stable`, `"partial"` if matches exist but none are stable,
+  `"gap"` if no rule matches at all), case-insensitive (e.g.
+  `detection://attack/techniques/T1003.001`). Backed by `_load_attack_techniques()`,
+  which parses the MITRE ATT&CK Enterprise STIX bundle downloaded to
+  `attack/enterprise-attack.json` by `scripts/download_attack_data.py` (gitignored, same
+  pattern as `hayabusa/`) and caches it in-memory (`_attack_techniques_cache`). Raises
+  `FileNotFoundError` pointing at that script if the file is missing, and again if the
+  requested technique ID isn't in the bundle.
 
-All three concrete/templated URIs are registered via the low-level API's
+All four concrete/templated URIs are registered via the low-level API's
 `list_resources`/`list_resource_templates`/`read_resource` handlers — there's no FastMCP
 `@mcp.resource` decorator involved, matching the rest of `server.py`'s low-level style.
 
@@ -40,14 +56,10 @@ All three concrete/templated URIs are registered via the low-level API's
 Still not implemented — documented here as the intended direction beyond the resources above.
 
 **Goals:**
-- Expose ATT&CK technique mappings as their own artifact (not just derived from rule tags)
-- Allow Claude to query detection coverage (e.g. "which techniques have no rule at all")
+- A dedicated coverage-query tool (e.g. "list every technique with no rule at all" across
+  the whole ATT&CK matrix, not just one technique at a time) — `detection://attack/techniques/{id}`
+  only answers the question for a single technique you already know the ID of.
 - Combine with Hayabusa scanning (the existing `scan_evtx`/`get_hayabusa_rules` tools)
-
-**Planned structure:**
-- `mappings/` — ATT&CK technique to rule mappings (e.g. covering techniques with no
-  matching Sigma rule yet, which `detection://rules/by-technique/{id}` alone can't surface
-  since it only knows about rules that exist)
 
 ## Tools
 
@@ -81,6 +93,9 @@ Still not implemented — documented here as the intended direction beyond the r
   platform). Gitignored — not vendored, reproducible on demand. `hayabusa/rules/` is
   itself a git checkout (has its own `.git/`), which is part of why it's excluded rather
   than added as a submodule.
+- **`attack/`** — the MITRE ATT&CK Enterprise STIX bundle (`enterprise-attack.json`, ~50MB),
+  installed by `scripts/download_attack_data.py`. Gitignored — not vendored, reproducible
+  on demand, same pattern as `hayabusa/`.
 - **`samples/`** — test fixture EVTX file(s), auto-downloaded by `test_scan_evtx.py` on
   first run if missing. Gitignored.
 - **`logs/`** — scratch error logs from manual CLI testing. Gitignored.
@@ -103,9 +118,12 @@ Still not implemented — documented here as the intended direction beyond the r
   - `test_resources.py` — exercises `list_resources`, `list_resource_templates`, and
     `read_resource` directly (async functions run via `asyncio.run`, not through the MCP
     stdio transport), including the error paths (unknown rule name, empty technique_id,
-    unrecognized URI scheme).
-  - `conftest.py` — autouse fixture that resets `server._detection_rules_cache` before/after
-    each test so tests don't leak the in-memory rule cache across each other.
+    unrecognized URI scheme). The `detection://attack/techniques/{id}` tests are marked
+    `requires_attack_data` and skip themselves if `attack/enterprise-attack.json` hasn't
+    been downloaded, so the suite stays runnable without network access.
+  - `conftest.py` — autouse fixtures that reset `server._detection_rules_cache` and
+    `server._attack_techniques_cache` before/after each test so tests don't leak
+    in-memory caches across each other.
   - Needs `pytest` and `pysigma`, tracked in `requirements-dev.txt` (not `requirements.txt`,
     since neither is needed at runtime by the live server).
 
