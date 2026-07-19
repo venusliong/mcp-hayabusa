@@ -2,10 +2,12 @@
 """MCP server that wraps Hayabusa for EVTX analysis (low-level API)."""
 
 import asyncio
+import datetime
 import json
 import re
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 import mcp.server.stdio
@@ -106,6 +108,53 @@ GET_HAYABUSA_RULES_SCHEMA = {
     "required": [],
 }
 
+ANALYZE_COVERAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "technique_id": {
+            "type": ["string", "null"],
+            "description": (
+                "Get a coverage report for a single ATT&CK technique, e.g. \"T1003.001\". "
+                "Mutually exclusive with tactic; provide exactly one."
+            ),
+        },
+        "tactic": {
+            "type": ["string", "null"],
+            "description": (
+                "Get an aggregate coverage report across every non-deprecated technique in "
+                "an ATT&CK tactic, e.g. \"credential-access\" or \"Credential Access\". "
+                "Mutually exclusive with technique_id; provide exactly one."
+            ),
+        },
+    },
+    "required": [],
+}
+
+SUGGEST_RULE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "technique_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "ATT&CK technique ID to check coverage for and suggest a detection "
+                "approach if it's a gap, e.g. \"T1027\"."
+            ),
+        },
+        "create_file": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "If true and the technique isn't already covered, write a starter Sigma "
+                "rule template (status: experimental, placeholder selection logic) to "
+                "rules/ instead of just describing the suggested approach. Fails if a "
+                "file with the generated name already exists. No-op if already covered."
+            ),
+        },
+    },
+    "required": ["technique_id"],
+}
+
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
@@ -123,6 +172,30 @@ async def list_tools() -> list[types.Tool]:
                 "Useful for discovering what rules exist before running scan_evtx."
             ),
             inputSchema=GET_HAYABUSA_RULES_SCHEMA,
+        ),
+        types.Tool(
+            name="analyze_coverage",
+            description=(
+                "Analyze detection coverage against our Sigma rules (rules/) for a single "
+                "ATT&CK technique or an entire tactic. Provide technique_id for a single-"
+                "technique report (same data as detection://attack/techniques/{id}: the "
+                "technique detail, matching rules, and a covered/partial/gap verdict). "
+                "Provide tactic for an aggregate report across every non-deprecated technique "
+                "in that tactic, including the list of techniques with no rule at all (gaps) "
+                "and those with only non-stable rules (partial)."
+            ),
+            inputSchema=ANALYZE_COVERAGE_SCHEMA,
+        ),
+        types.Tool(
+            name="suggest_rule",
+            description=(
+                "Check whether an ATT&CK technique already has Sigma rule coverage "
+                "(rules/), and if not, suggest a detection approach — a best-guess "
+                "Sigma logsource category plus any MITRE ATT&CK detection-analytic "
+                "guidance available for that technique. Set create_file=true to also "
+                "write a starter rule template (status: experimental) to fill in."
+            ),
+            inputSchema=SUGGEST_RULE_SCHEMA,
         ),
     ]
 
@@ -431,8 +504,45 @@ def _load_attack_techniques() -> dict[str, dict]:
     with ATTACK_DATA_PATH.open() as f:
         bundle = json.load(f)
 
+    objects = bundle.get("objects", [])
+
+    # ATT&CK's newer "detection strategy" model: each technique may have a
+    # detection-strategy (via a "detects" relationship) that references one or more
+    # analytics, and each analytic carries a human-written description plus log
+    # source references (data component name + suggested channel). This is real
+    # MITRE-authored detection guidance, not just a technique description, so it's
+    # worth surfacing for suggest_rule's "suggest a detection approach" step.
+    analytics_by_id = {
+        obj["id"]: obj for obj in objects if obj.get("type") == "x-mitre-analytic"
+    }
+    detection_strategies_by_id = {
+        obj["id"]: obj for obj in objects if obj.get("type") == "x-mitre-detection-strategy"
+    }
+    guidance_by_technique_stix_id: dict[str, list[dict]] = {}
+    for obj in objects:
+        if obj.get("type") != "relationship" or obj.get("relationship_type") != "detects":
+            continue
+        strategy = detection_strategies_by_id.get(obj.get("source_ref"))
+        if strategy is None:
+            continue
+        analytics = []
+        for analytic_ref in strategy.get("x_mitre_analytic_refs") or []:
+            analytic = analytics_by_id.get(analytic_ref)
+            if analytic is None:
+                continue
+            analytics.append({
+                "description": analytic.get("description"),
+                "log_sources": [
+                    {"name": ls.get("name"), "channel": ls.get("channel")}
+                    for ls in analytic.get("x_mitre_log_source_references") or []
+                ],
+            })
+        if analytics:
+            technique_stix_id = obj.get("target_ref")
+            guidance_by_technique_stix_id.setdefault(technique_stix_id, []).extend(analytics)
+
     techniques = {}
-    for obj in bundle.get("objects", []):
+    for obj in objects:
         if obj.get("type") != "attack-pattern":
             continue
         technique_id = None
@@ -457,6 +567,7 @@ def _load_attack_techniques() -> dict[str, dict]:
                 if phase.get("kill_chain_name") == "mitre-attack" and phase.get("phase_name")
             }),
             "deprecated": bool(obj.get("x_mitre_deprecated")) or bool(obj.get("revoked")),
+            "detection_guidance": guidance_by_technique_stix_id.get(obj["id"], []),
         }
 
     _attack_techniques_cache = techniques
@@ -474,6 +585,291 @@ def _coverage_assessment(rules: list[dict]) -> str:
     if any(r.get("status") == "stable" for r in rules):
         return "covered"
     return "partial"
+
+
+def _build_technique_report(technique_id: str) -> dict:
+    """Build the single-technique coverage payload shared by the ATT&CK technique
+    resource and the analyze_coverage tool."""
+    techniques = _load_attack_techniques()
+    technique = techniques.get(technique_id)
+    if technique is None:
+        raise FileNotFoundError(f"No ATT&CK technique {technique_id!r} found")
+
+    matches = [
+        _rule_summary(r)
+        for r in _load_detection_rules()
+        if technique_id in _technique_ids_from_tags(r["tags"])
+    ]
+    return {
+        "technique_id": technique_id,
+        "name": technique["name"],
+        "description": technique["description"],
+        "url": technique["url"],
+        "is_subtechnique": technique["is_subtechnique"],
+        "tactics": technique["tactics"],
+        "deprecated": technique["deprecated"],
+        "detecting_rules": matches,
+        "coverage": _coverage_assessment(matches),
+    }
+
+
+def _normalize_tactic(tactic: str) -> str:
+    """Normalize a tactic name to ATT&CK's kill-chain-phase slug form,
+    e.g. "Credential Access" -> "credential-access"."""
+    return re.sub(r"[\s_]+", "-", tactic.strip().lower())
+
+
+def analyze_coverage(technique_id: str | None = None, tactic: str | None = None) -> dict:
+    """Report Sigma rule (rules/) coverage for one ATT&CK technique or an entire tactic."""
+    technique_id = technique_id.strip().upper() if technique_id else None
+    tactic_norm = _normalize_tactic(tactic) if tactic else None
+
+    if technique_id and tactic_norm:
+        raise ValueError("Provide only one of technique_id or tactic, not both")
+    if not technique_id and not tactic_norm:
+        raise ValueError("Must provide either technique_id or tactic")
+
+    if technique_id:
+        return _build_technique_report(technique_id)
+
+    techniques = _load_attack_techniques()
+    detection_rules = _load_detection_rules()
+
+    all_tactics = sorted({t for tech in techniques.values() for t in tech["tactics"]})
+    if tactic_norm not in all_tactics:
+        raise ValueError(f"Unknown tactic {tactic!r}. Valid tactics: {', '.join(all_tactics)}")
+
+    matching_techniques = sorted(
+        (t for t in techniques.values() if tactic_norm in t["tactics"] and not t["deprecated"]),
+        key=lambda t: t["technique_id"],
+    )
+
+    technique_reports = []
+    for tech in matching_techniques:
+        matches = [
+            _rule_summary(r)
+            for r in detection_rules
+            if tech["technique_id"] in _technique_ids_from_tags(r["tags"])
+        ]
+        technique_reports.append({
+            "technique_id": tech["technique_id"],
+            "name": tech["name"],
+            "is_subtechnique": tech["is_subtechnique"],
+            "coverage": _coverage_assessment(matches),
+            "detecting_rules": [m["rule_name"] for m in matches],
+        })
+
+    covered = [t for t in technique_reports if t["coverage"] == "covered"]
+    partial = [t for t in technique_reports if t["coverage"] == "partial"]
+    gap = [t for t in technique_reports if t["coverage"] == "gap"]
+
+    return {
+        "tactic": tactic_norm,
+        "total_techniques": len(technique_reports),
+        "covered_count": len(covered),
+        "partial_count": len(partial),
+        "gap_count": len(gap),
+        "covered_techniques": covered,
+        "partial_techniques": partial,
+        "gap_techniques": [
+            {"technique_id": t["technique_id"], "name": t["name"]} for t in gap
+        ],
+    }
+
+
+# Substring hints (checked in order) mapping an ATT&CK data component / log source
+# name to the closest Sigma logsource category, used when a technique has MITRE
+# detection-analytic guidance to draw on.
+_LOGSOURCE_CATEGORY_HINTS = [
+    ("named pipe", "pipe_created"),
+    ("scheduled job", "scheduled_task"),
+    ("wmi", "wmi_event"),
+    ("powershell", "ps_script"),
+    ("script", "ps_script"),
+    ("command", "process_creation"),
+    ("process access", "process_access"),
+    ("process", "process_creation"),
+    ("module", "image_load"),
+    ("driver", "driver_load"),
+    ("registry", "registry_event"),
+    ("dns", "dns_query"),
+    ("network traffic", "network_connection"),
+    ("network connection", "network_connection"),
+    ("file", "file_event"),
+]
+
+# Fallback when a technique has no MITRE detection-analytic guidance to draw on
+# (its ATT&CK data hasn't been migrated to the newer detection-strategy model yet).
+_TACTIC_LOGSOURCE_FALLBACK = {
+    "reconnaissance": "network_connection",
+    "resource-development": "network_connection",
+    "initial-access": "network_connection",
+    "execution": "process_creation",
+    "persistence": "registry_event",
+    "privilege-escalation": "process_creation",
+    "defense-evasion": "process_creation",
+    "credential-access": "process_creation",
+    "discovery": "process_creation",
+    "lateral-movement": "network_connection",
+    "collection": "file_event",
+    "command-and-control": "network_connection",
+    "exfiltration": "network_connection",
+    "impact": "file_event",
+}
+
+_DEFAULT_LOGSOURCE_CATEGORY = "process_creation"
+
+
+def _guess_logsource_category(technique: dict) -> tuple[str, str]:
+    """Best-effort Sigma logsource category for a technique with no rule coverage yet.
+
+    Returns (category, basis) where basis records how the guess was derived, since
+    it's a heuristic starting point for an analyst to refine, not a certainty.
+    """
+    for analytic in technique.get("detection_guidance") or []:
+        for log_source in analytic.get("log_sources") or []:
+            name = str(log_source.get("name") or "").lower()
+            for hint, category in _LOGSOURCE_CATEGORY_HINTS:
+                if hint in name:
+                    return category, "attack-analytics"
+
+    for tactic in technique.get("tactics") or []:
+        if tactic in _TACTIC_LOGSOURCE_FALLBACK:
+            return _TACTIC_LOGSOURCE_FALLBACK[tactic], "tactic-fallback"
+
+    return _DEFAULT_LOGSOURCE_CATEGORY, "default-fallback"
+
+
+def _build_rule_suggestion(technique: dict) -> dict:
+    """Suggest a detection approach for a technique that isn't (fully) covered yet."""
+    category, basis = _guess_logsource_category(technique)
+    guidance = [
+        analytic["description"]
+        for analytic in technique.get("detection_guidance") or []
+        if analytic.get("description")
+    ]
+    return {
+        "suggested_logsource": {"product": "windows", "category": category},
+        "logsource_basis": basis,
+        "guidance": guidance[:3],
+        "tactics": technique.get("tactics") or [],
+    }
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug or "rule"
+
+
+def _generate_rule_template(technique: dict, suggestion: dict) -> tuple[str, str]:
+    """Build a starter Sigma rule (rule_name, yaml_text) for an uncovered technique.
+
+    This is deliberately a skeleton, not a finished detection: the selection logic
+    is a placeholder because guessing exact event IDs/field values without a real
+    log sample would be a false claim of coverage. status stays "experimental" until
+    a human validates and promotes it.
+    """
+    technique_id = technique["technique_id"]
+    category = suggestion["suggested_logsource"]["category"]
+    rule_name = (
+        f"{category}_win_{_slugify(technique['name'])}_{technique_id.lower().replace('.', '_')}"
+    )
+
+    tags = [f"attack.{tactic}" for tactic in suggestion["tactics"]]
+    tags.append(f"attack.{technique_id.lower()}")
+
+    data = {
+        "title": f"Potential {technique['name']} Activity ({technique_id})",
+        "id": str(uuid.uuid4()),
+        "status": "experimental",
+        "description": (
+            f"TODO: replace with the actual detection logic for {technique_id} "
+            f"({technique['name']}). This rule is an auto-generated starting point "
+            "and does not detect anything yet."
+        ),
+        "references": [technique["url"]] if technique.get("url") else [],
+        "author": "suggest_rule tool (mcp-hayabusa)",
+        "date": datetime.date.today().strftime("%Y/%m/%d"),
+        "tags": tags,
+        "logsource": {"product": "windows", "category": category},
+        "detection": {
+            "selection": {"TODO_FieldName": "TODO_REPLACE_WITH_ACTUAL_VALUE"},
+            "condition": "selection",
+        },
+        "falsepositives": [
+            "Unknown — this is a placeholder rule; validate against real data before "
+            "promoting status to stable.",
+        ],
+        "level": "medium",
+    }
+
+    header_lines = [
+        f"# Auto-generated starting point for {technique_id} ({technique['name']}).",
+        "# The selection logic below is a placeholder — replace it with real field/value",
+        "# matches for your log source, then flip status to 'stable' once validated.",
+    ]
+    if suggestion["guidance"]:
+        header_lines.append("#")
+        header_lines.append("# MITRE ATT&CK detection-analytic guidance for this technique:")
+        for note in suggestion["guidance"]:
+            first_line = note.strip().splitlines()[0]
+            header_lines.append(f"# - {first_line}")
+    header = "\n".join(header_lines) + "\n"
+
+    body = yaml.dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True, width=100)
+    return rule_name, header + body
+
+
+def suggest_rule(technique_id: str, create_file: bool = False) -> dict:
+    """Check Sigma rule coverage for an ATT&CK technique and, if it's not fully
+    covered, suggest a detection approach (optionally writing a starter rule
+    template to rules/)."""
+    if not technique_id or not technique_id.strip():
+        raise ValueError("technique_id is required")
+    technique_id = technique_id.strip().upper()
+
+    report = _build_technique_report(technique_id)
+
+    result = {
+        **report,
+        "needs_rule": report["coverage"] != "covered",
+        "suggestion": None,
+        "rule_created": False,
+        "rule_path": None,
+    }
+
+    if not result["needs_rule"]:
+        return result
+
+    technique = _load_attack_techniques()[technique_id]
+    suggestion = _build_rule_suggestion(technique)
+    result["suggestion"] = suggestion
+
+    if create_file:
+        rule_name, yaml_text = _generate_rule_template(technique, suggestion)
+        rule_path = DETECTION_RULES_DIR / f"{rule_name}.yml"
+        if rule_path.exists():
+            raise FileExistsError(
+                f"A rule template already exists at {rule_path}; remove or rename it "
+                "before generating a new one."
+            )
+
+        rule_path.write_text(yaml_text)
+
+        global _detection_rules_cache
+        _detection_rules_cache = None
+
+        try:
+            rule_path_display = rule_path.relative_to(REPO_ROOT)
+        except ValueError:
+            rule_path_display = rule_path
+
+        result["rule_created"] = True
+        result["rule_path"] = str(rule_path_display)
+        result["rule_name"] = rule_name
+        result["rule_yaml"] = yaml_text
+
+    return result
 
 
 DETECTION_RULES_LIST_URI = "detection://rules"
@@ -568,27 +964,7 @@ async def read_resource(uri: AnyUrl) -> list[ReadResourceContents]:
         if not technique_id:
             raise ValueError("Missing technique_id in URI")
 
-        techniques = _load_attack_techniques()
-        technique = techniques.get(technique_id)
-        if technique is None:
-            raise FileNotFoundError(f"No ATT&CK technique {technique_id!r} found")
-
-        matches = [
-            _rule_summary(r)
-            for r in _load_detection_rules()
-            if technique_id in _technique_ids_from_tags(r["tags"])
-        ]
-        payload = {
-            "technique_id": technique_id,
-            "name": technique["name"],
-            "description": technique["description"],
-            "url": technique["url"],
-            "is_subtechnique": technique["is_subtechnique"],
-            "tactics": technique["tactics"],
-            "deprecated": technique["deprecated"],
-            "detecting_rules": matches,
-            "coverage": _coverage_assessment(matches),
-        }
+        payload = _build_technique_report(technique_id)
         return [ReadResourceContents(content=json.dumps(payload, indent=2), mime_type="application/json")]
 
     # NOTE: this must come after DETECTION_RULES_BY_TECHNIQUE_PREFIX above, since
@@ -627,6 +1003,18 @@ async def call_tool(name: str, arguments: dict) -> dict:
         min_severity = arguments.get("min_severity")
         max_results = arguments.get("max_results")
         return await asyncio.to_thread(get_hayabusa_rules, keyword, min_severity, max_results)
+
+    if name == "analyze_coverage":
+        technique_id = arguments.get("technique_id")
+        tactic = arguments.get("tactic")
+        return await asyncio.to_thread(analyze_coverage, technique_id, tactic)
+
+    if name == "suggest_rule":
+        technique_id = arguments.get("technique_id")
+        if not technique_id:
+            raise ValueError("Missing required argument: technique_id")
+        create_file = bool(arguments.get("create_file") or False)
+        return await asyncio.to_thread(suggest_rule, technique_id, create_file)
 
     raise ValueError(f"Unknown tool: {name}")
 

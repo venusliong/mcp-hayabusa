@@ -8,12 +8,12 @@ Hayabusa scanning: implemented. The server runs and both tools are manually test
 
 Sigma rule resources: implemented and under pytest (`tests/`). This is the one part of the project with a real automated test suite; everything else is still manual-script-only.
 
-Detection engineering knowledge base: **mostly implemented.** Sigma rules under `rules/`
+Detection engineering knowledge base: **implemented.** Sigma rules under `rules/`
 are exposed as MCP resources, and ATT&CK technique lookups (name/description/coverage)
 are exposed via `detection://attack/techniques/{technique_id}`, sourced live from the
 MITRE ATT&CK STIX bundle rather than a checked-in `mappings/` directory — that directory
-is no longer planned. A dedicated coverage-query tool (e.g. "list every technique with no
-rule at all") is still **not implemented**; see "Planned expansion" below.
+is no longer planned. The coverage-query tool called out below as the remaining gap is
+now implemented as `analyze_coverage`.
 
 ## Purpose
 
@@ -51,16 +51,6 @@ All four concrete/templated URIs are registered via the low-level API's
 `list_resources`/`list_resource_templates`/`read_resource` handlers — there's no FastMCP
 `@mcp.resource` decorator involved, matching the rest of `server.py`'s low-level style.
 
-## Planned expansion: detection engineering knowledge base
-
-Still not implemented — documented here as the intended direction beyond the resources above.
-
-**Goals:**
-- A dedicated coverage-query tool (e.g. "list every technique with no rule at all" across
-  the whole ATT&CK matrix, not just one technique at a time) — `detection://attack/techniques/{id}`
-  only answers the question for a single technique you already know the ID of.
-- Combine with Hayabusa scanning (the existing `scan_evtx`/`get_hayabusa_rules` tools)
-
 ## Tools
 
 - **`scan_evtx(path, min_severity=None, rule_filter=None, output_format="summary", max_results=None)`**
@@ -77,12 +67,54 @@ Still not implemented — documented here as the intended direction beyond the r
   after the first call (`_rules_cache` in `server.py`), so a `hayabusa update-rules`
   run against a live server process won't be picked up until restart. Meant to be called
   before `scan_evtx` so a client can discover what rules exist / pick a `rule_filter`.
+- **`suggest_rule(technique_id, create_file=False)`**
+  The gap-filling counterpart to `analyze_coverage`: checks a single technique's
+  coverage (via the same `_build_technique_report()` helper), and if it isn't
+  `"covered"`, suggests a detection approach instead of just reporting the gap.
+  The suggestion isn't guesswork from the technique name alone — `_load_attack_techniques()`
+  also parses the STIX bundle's newer detection-strategy/analytic objects (`x-mitre-detection-strategy`,
+  `x-mitre-analytic`, and their `detects` relationships to techniques) into a
+  `detection_guidance` list of MITRE-authored analytic descriptions and log-source
+  references per technique, when present. `_guess_logsource_category()` maps those
+  log-source names to a Sigma logsource category via `_LOGSOURCE_CATEGORY_HINTS`
+  (e.g. "Process: Process Creation" → `process_creation`), falling back to
+  `_TACTIC_LOGSOURCE_FALLBACK` (by tactic) and then a hardcoded default if a
+  technique has no detection-strategy data yet. If `create_file=true` and the
+  technique needs a rule, `_generate_rule_template()` writes a starter Sigma YAML to
+  `rules/<generated_name>.yml`: `status: experimental`, a placeholder
+  `detection.selection` (deliberately not a real detection — guessing exact field/value
+  matches without a log sample would be a false coverage claim), the MITRE guidance
+  text as header comments, and `level: medium` as a generic starting point. Raises
+  `FileExistsError` rather than overwriting if that filename is already taken, and
+  resets `_detection_rules_cache` after writing so the new rule is immediately visible
+  to `detection://` resources and `analyze_coverage` without a server restart. A
+  covered technique makes `create_file` a no-op (`rule_created: false`) regardless of
+  the flag. Coverage here is assessed against our own `rules/` Sigma rules only, same
+  as `analyze_coverage` and `detection://attack/techniques/{id}`.
+- **`analyze_coverage(technique_id=None, tactic=None)`**
+  The dedicated coverage-query tool that the resource endpoints alone couldn't provide:
+  `detection://attack/techniques/{id}` only answers the covered/partial/gap question for
+  one technique you already know the ID of. Takes exactly one of `technique_id` (e.g.
+  `"T1003.001"`) or `tactic` (e.g. `"credential-access"`, case/spacing-insensitive —
+  normalized via `_normalize_tactic()`); raises `ValueError` if given both or neither.
+  - `technique_id` mode returns the same payload as `detection://attack/techniques/{id}`
+    (built from the shared `_build_technique_report()` helper both now call).
+  - `tactic` mode aggregates across every non-deprecated technique in that tactic (per
+    the MITRE ATT&CK STIX bundle's `kill_chain_phases`), applying the same per-technique
+    `_coverage_assessment()` logic used elsewhere, and returns `covered_count`/
+    `partial_count`/`gap_count` plus the technique lists themselves — `gap_techniques` is
+    the "list every technique with no rule at all" answer for a whole tactic in one call.
+    Raises `ValueError` listing valid tactic slugs if the tactic name doesn't match any
+    technique's tactics.
+  - Like the `detection://` resources, coverage here is assessed against our own
+    `rules/` Sigma rules only, not Hayabusa's bundled rule pack — matching the semantics
+    `detection://attack/techniques/{id}` already established.
 
 ## Architecture
 
 - **`server.py`** — the live server, using the MCP low-level `Server` API
   (`list_tools`/`call_tool`). This is what `.mcp.json` actually launches
-  (`python3 server.py`) and what `test_scan_evtx.py` imports directly. Both tools
+  (`python3 server.py`) and what `test_scan_evtx.py` imports directly. All four tools
   above are fully implemented here. (This file used to be named `server_lowlevel.py`;
   it was renamed to `server.py` to remove the confusion of having two same-purpose
   files — there used to be a second, unused FastMCP-based skeleton also named
@@ -121,6 +153,22 @@ Still not implemented — documented here as the intended direction beyond the r
     unrecognized URI scheme). The `detection://attack/techniques/{id}` tests are marked
     `requires_attack_data` and skip themselves if `attack/enterprise-attack.json` hasn't
     been downloaded, so the suite stays runnable without network access.
+  - `test_analyze_coverage.py` — exercises `analyze_coverage()` directly (calling the
+    plain Python function, not through `call_tool`): both `technique_id` and `tactic`
+    modes, the argument-validation errors (both/neither given, unknown tactic, unknown
+    technique ID), case/spacing-insensitivity, and that deprecated techniques are excluded
+    from tactic-wide reports. Also marked `requires_attack_data` where it needs the STIX
+    bundle, same as `test_resources.py`.
+  - `test_suggest_rule.py` — exercises `suggest_rule()` directly: the already-covered
+    no-op path, the gap path's suggestion payload, case-insensitivity, unknown-technique
+    and empty-`technique_id` errors, and `create_file=True`'s file write — validated with
+    `pysigma` the same way `test_sigma_rules.py` validates real rules, plus the
+    `_detection_rules_cache` invalidation and the `FileExistsError` on a repeat write.
+    The file-writing tests use an `isolated_rules_dir` fixture (`monkeypatch.setattr(server,
+    "DETECTION_RULES_DIR", tmp_path)`) so they never touch the real `rules/` — note that
+    same redirect also changes what counts as "covered" for the duration of the test,
+    since coverage is read from `DETECTION_RULES_DIR` too, so the already-covered no-op
+    test deliberately does *not* use that fixture (it never reaches the write branch).
   - `conftest.py` — autouse fixtures that reset `server._detection_rules_cache` and
     `server._attack_techniques_cache` before/after each test so tests don't leak
     in-memory caches across each other.
