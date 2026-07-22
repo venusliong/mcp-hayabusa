@@ -1,6 +1,6 @@
 # Handoff — mcp-hayabusa
 
-_Last updated: 2026-07-18_
+_Last updated: 2026-07-21_
 
 ## What this is
 
@@ -12,9 +12,47 @@ the full architecture — it's up to date as of this handoff.
 
 ## Current state
 
-Branch is `main`, everything below is committed (latest commit `73f6449`, "Add
-analyze_coverage and suggest_rule tools for detection coverage gaps"). Nothing is
+Branch is `main`, everything below is committed (latest commit `2a59bdb`, "Add
+detection-engineering skill with validator/references, two new Sigma rules"). Nothing is
 uncommitted except the local permissions allowlist noise described below.
+
+## New this session: `.claude/skills/detection-engineering/`
+
+A Claude Code skill (not part of the MCP server itself — it's authoring/review tooling for
+`rules/`) that codifies the five standards this repo already applied ad hoc: ATT&CK tag,
+justified severity, documented false positives, at least one test case, lowercase_underscore
+naming. Structure:
+
+- `SKILL.md` — the standards doc + a review checklist, loaded automatically whenever a rule
+  is written or reviewed.
+- `scripts/validate-rule.py` — standalone (only needs `pyyaml`), checks 4 of the 5 standards
+  programmatically against a single rule file and prints a JSON report (`valid: true/false`,
+  per-check booleans, issue list). Not a schema validator — `python3 -m pytest
+  tests/test_sigma_rules.py` still owns that. Naming convention (standard 5) and severity
+  *justification* (vs. just a valid `level` value) are judgment calls the script doesn't
+  attempt.
+- `references/` — `example-rules/lsass_memory_access.yml` (one rule, all five standards
+  annotated inline), `severity-guide.md` (worked criteria per level, drawn from this repo's
+  actual rules), `false-positive-patterns.md` (five recurring FP categories with real
+  examples and how-to-distinguish notes).
+
+Two rule changes landed alongside it:
+
+- **`rules/proc_creation_win_lsass_dump_comsvcs_minidump.yml`** — new. Detects the
+  comsvcs.dll `MiniDump` export LOLBIN technique (`rundll32.exe ... comsvcs.dll, MiniDump
+  <pid> ...`) for dumping LSASS, T1003.001. Distinct from the existing procdump-based and
+  GrantedAccess-mask-based LSASS rules already in `rules/`.
+- **`rules/azure_app_ropc_authentication.yml`** — this file already existed in the working
+  tree but had **never been committed** before this session (it showed up as untracked,
+  origin unclear — likely dropped in by a prior session or the user outside git). Fixed its
+  one standards gap (no test-case comment block) and committed it for the first time. Worth
+  flagging: unlike every other rule in `rules/`, this one is a verbatim SigmaHQ import
+  (`author: Mark Morowczynski, Bailey Bercik`, `date: 2022-06-01` in ISO format rather than
+  this repo's usual `YYYY/MM/DD`) rather than authored for this project — if more imported
+  rules show up the same way, they'll need the same standards pass before committing.
+
+`rules/` is now 7 files (was 6 tracked + this 1 untracked). Full `pytest` is 77 tests (was
+69), all passing.
 
 Four MCP tools, all fully implemented in **`server.py`** (the file `.mcp.json` launches;
 `server_lowlevel.py` and the unused FastMCP stub are both long gone):
@@ -93,10 +131,13 @@ to commit permissions changes.
 
 ```
 python3 -m pytest              # Sigma rules + detection:// resources + analyze_coverage +
-                                # suggest_rule (69 tests, fast, no network needed once
+                                # suggest_rule (77 tests, fast, no network needed once
                                 # attack/ is downloaded — ATT&CK-dependent tests self-skip
                                 # otherwise via the requires_attack_data marker)
 python3 test_scan_evtx.py      # manual script: scan_evtx + get_hayabusa_rules end-to-end
+
+# Standards check for a single Sigma rule (new this session, separate from pytest):
+python3 .claude/skills/detection-engineering/scripts/validate-rule.py rules/<name>.yml
 ```
 
 `test_scan_evtx.py` downloads a sample EVTX (Mimikatz/Sysmon) into `samples/` on first run
@@ -136,7 +177,8 @@ after the test run that `rules/` stayed clean.
 
 ## Suggested next steps
 
-1. Figure out what the three untracked `credential_access_rules*.json` files are for.
+1. Figure out what the three untracked `credential_access_rules*.json` files are for —
+   still unresolved, still explicitly deferred by the user across multiple sessions now.
 2. If you want CI-style confidence for the Hayabusa tools too, convert
    `test_scan_evtx.py` into real `pytest` cases.
 3. Consider pinning the Hayabusa release/rules commit and the ATT&CK STIX bundle version
@@ -146,3 +188,11 @@ after the test run that `rules/` stayed clean.
 5. Consider whether `suggest_rule`'s tactic→logsource fallback table
    (`_TACTIC_LOGSOURCE_FALLBACK`) needs updating for tactic names ATT&CK has introduced
    outside the classic eight (e.g. `"stealth"`, seen on T1027 this session).
+6. The two "should-fix, not blocking" items flagged during `azure_app_ropc_authentication.yml`'s
+   review are still open: its severity (`medium`) has no explicit justification sentence in
+   `description:`, and its `attack.t1078` tag could be the more specific `attack.t1078.004`
+   (Valid Accounts: Cloud Accounts) given it's Entra ID sign-in data.
+7. `validate-rule.py` only covers 4 of the skill's 5 standards (not naming convention, and
+   severity checking is "is it a valid value" not "is it justified") — could extend it if
+   those turn out to matter enough to automate, but they're arguably better as human review
+   judgment calls per SKILL.md's own framing.
