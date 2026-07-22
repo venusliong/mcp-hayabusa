@@ -1,0 +1,86 @@
+# Reference example — annotated to show all five detection-engineering standards
+# from SKILL.md in one rule. This file lives under the skill's references/ dir, not
+# rules/, so it is NOT picked up by tests/test_sigma_rules.py or the server's
+# detection:// resources; it's a teaching fixture, not a live detection.
+#
+# Copy the structure, not necessarily the exact IDs/dates — generate a fresh UUID4
+# for any real rule (`python3 -c "import uuid; print(uuid.uuid4())"`).
+
+title: Suspicious Access Rights Requested Against LSASS Process
+id: 8bd8edbe-bebe-47f9-b181-6275e59cabdf
+status: stable
+description: |
+    Detects process access (Sysmon Event ID 10) against lsass.exe with a
+    GrantedAccess mask commonly associated with credential dumping tools
+    (Mimikatz, ProcDump, custom minidump implementations) rather than legitimate
+    LSA callers.
+
+    Standard 2 (severity with justification) lives here, in prose: High severity
+    because successful execution yields cleartext/hashed credentials enabling
+    lateral movement, and this mask pattern is rare in legitimate activity, so
+    hits are high-confidence rather than merely suspicious.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/16
+tags:
+    # Standard 1 (ATT&CK technique mapping): tactic tag is optional-but-preferred
+    # alongside the technique tag; the technique tag itself is required.
+    - attack.credential-access
+    - attack.t1003.001
+logsource:
+    category: process_access
+    product: windows
+    service: sysmon
+detection:
+    selection_target:
+        TargetImage|endswith: '\lsass.exe'
+    selection_access:
+        GrantedAccess:
+            - '0x1010'
+            - '0x1410'
+            - '0x1438'
+            - '0x143a'
+            - '0x1fffff'
+    # A filter list keeps the rule from firing on known-legitimate callers instead
+    # of relying solely on prose false-positive documentation — the two work
+    # together, not in place of each other.
+    filter_known_source:
+        SourceImage|endswith:
+            - '\werfault.exe'
+            - '\wermgr.exe'
+            - '\MsMpEng.exe'
+    condition: selection_target and selection_access and not filter_known_source
+falsepositives:
+    # Standard 3 (documented false positives): concrete and specific — names the
+    # actual processes involved and why they're excluded, not "Unknown" or
+    # "Legitimate admin activity" with no specifics. See
+    # references/false-positive-patterns.md for more patterns like this one.
+    - Endpoint security agents and crash-reporting utilities that legitimately open
+      lsass.exe with broad access rights (should be excluded via filter list above).
+level: high
+
+# Standard 4 (at least one test case): a worked true-positive example, plus a
+# true-negative since the selection logic disambiguates on both a GrantedAccess
+# mask AND a filtered source image — not just the target process name.
+#
+# Test case (true positive):
+#   TargetImage: C:\Windows\System32\lsass.exe
+#   SourceImage: C:\Tools\procdump64.exe
+#   GrantedAccess: 0x1fffff
+#
+# Test case (should NOT match — filtered source):
+#   TargetImage: C:\Windows\System32\lsass.exe
+#   SourceImage: C:\ProgramData\Microsoft\Windows Defender\Platform\...\MsMpEng.exe
+#   GrantedAccess: 0x1fffff
+#
+# Test case (should NOT match — benign access mask):
+#   TargetImage: C:\Windows\System32\lsass.exe
+#   SourceImage: C:\Windows\System32\svchost.exe
+#   GrantedAccess: 0x1000
+
+# Standard 5 (rule naming) is enforced by the FILENAME of this file, not its
+# content: lsass_memory_access.yml is lowercase_with_underscores. In rules/ proper,
+# prefix it to match logsource.category/product per the convention in SKILL.md,
+# e.g. proc_access_win_lsass_memory_access.yml.

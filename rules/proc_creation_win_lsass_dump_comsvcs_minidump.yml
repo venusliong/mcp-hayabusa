@@ -1,0 +1,53 @@
+title: LSASS Memory Dump via comsvcs.dll MiniDump Export
+id: 80f92f21-824b-4158-b65b-412e7c5808d4
+status: stable
+description: |
+    Detects invocation of the undocumented MiniDump export in comsvcs.dll (typically
+    via rundll32.exe) targeting the lsass.exe process ID, a living-off-the-land
+    technique for dumping LSASS memory without dropping a separate dumping tool such
+    as ProcDump. High severity: successful execution yields cleartext/hashed
+    credentials enabling lateral movement, and legitimate use of this specific
+    undocumented export against lsass is effectively unheard of, so hits are
+    high-confidence.
+references:
+    - https://attack.mitre.org/techniques/T1003/001/
+    - https://lolbas-project.github.io/lolbas/Libraries/Comsvcs/
+    - https://learn.microsoft.com/en-us/sysinternals/downloads/procdump
+author: mcp-hayabusa detection engineering KB
+date: 2026/07/21
+tags:
+    - attack.credential-access
+    - attack.t1003.001
+    - attack.defense-evasion
+    - attack.t1218.011
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection_img:
+        - Image|endswith: '\rundll32.exe'
+        - OriginalFileName: 'RUNDLL32.EXE'
+    selection_dll:
+        CommandLine|contains: 'comsvcs.dll'
+    selection_export:
+        CommandLine|contains:
+            - 'MiniDump'
+            - '#24'
+    condition: selection_img and selection_dll and selection_export
+falsepositives:
+    - None known. The comsvcs.dll MiniDump export is undocumented by Microsoft and has
+      no legitimate administrative workflow that invokes it by name (or its ordinal
+      export number 24) against a process via rundll32.exe. Genuine crash-dump
+      collection uses ProcDump, Task Manager, or WerFault instead.
+level: high
+
+# Test case (true positive):
+#   Image: C:\Windows\System32\rundll32.exe
+#   OriginalFileName: RUNDLL32.EXE
+#   CommandLine: rundll32.exe C:\Windows\System32\comsvcs.dll, MiniDump 668 C:\Windows\Temp\lsass.dmp full
+#
+# Test case (true positive, ordinal form):
+#   CommandLine: rundll32.exe C:\Windows\System32\comsvcs.dll, #24 668 C:\Windows\Temp\lsass.dmp full
+#
+# Test case (should NOT match):
+#   CommandLine: rundll32.exe C:\Windows\System32\shell32.dll,Control_RunDLL desk.cpl
